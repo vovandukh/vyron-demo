@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vyron — boot and launch animations (prototype)</title>
+<!--
+  Prototype of the two animations for the TFT35 (480×320) on a GPU-less CB1.
+  1) "Boot" — what shows while the system starts: three parts of the logo (left and right bar of the V, "D")
+     drop in from above, each from its own side, and click into place; then three dots "breathe" below.
+     The last frame equals the first frame of "Launch", so there is no jump between them.
+  2) "Launch Vyron" — a shine sweeps the logo, the word mark appears, the logo flies to its place in the top bar
+     and the UI fades in below.
+
+  Why it stays smooth on an SPI screen (the CPU draws every frame):
+  - only transform and opacity are animated — no filter, blur, shadows, animated gradients or size changes;
+  - every moving part is its own small layer (will-change), the background is painted once;
+  - the logo is flat during the animation (no feDropShadow); the shaded version lives in the UI;
+  - only the three dots loop forever (opacity only).
+
+  Parameters: ?native — fullscreen without the panel (for the TFT), ?auto=boot|launch|full, ?fps — frame counter,
+  ?t=ms — freeze a frame (for screenshots; install/splash/build.mjs renders the boot frames this way).
+-->
+<style>
+:root{--dots:1200ms;--brand:#f03a2e;--accent-rgb:255,107,90;--brand-rgb:240,58,46;--k:1;
+  --out:cubic-bezier(.2,.8,.2,1);--pop:cubic-bezier(.34,1.45,.5,1);--ease:cubic-bezier(.32,.72,0,1)}
+html,body{margin:0;height:100%;background:#141416;color:#c7c7cc;font-family:Montserrat,system-ui,"DejaVu Sans",sans-serif}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px}
+body.native{display:block;background:#000}
+body.native .panel{display:none}
+.frame{zoom:2;border-radius:6px;overflow:hidden;box-shadow:0 0 0 1px #2c2c2e}
+body.native .frame{zoom:1;border-radius:0;box-shadow:none}
+@media (max-width:1000px),(max-height:780px){.frame{zoom:1}}
+
+/* ===== 480×320 stage ===== */
+.stage{position:relative;width:480px;height:320px;overflow:hidden;background:#060607}
+/* Glow as in Screen: a static gradient that only fades in */
+.glow{position:absolute;inset:0;opacity:0;
+  background:radial-gradient(ellipse 70% 80% at 0% 110%,rgba(var(--brand-rgb),.28),transparent 65%),
+             radial-gradient(ellipse 55% 60% at 105% -10%,rgba(var(--accent-rgb),.12),transparent 60%)}
+
+.fly{position:absolute;left:184px;top:104px;width:112px;height:112px;will-change:transform}
+.mark{position:absolute;inset:0;will-change:transform}
+.mark svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+.part{position:absolute;inset:0;opacity:0;will-change:transform,opacity}
+/* Landing pivot — the bottom of each part (in % of the viewBox frame) */
+.vl{transform-origin:28% 83%}
+.vr{transform-origin:72% 83%}
+.d{transform-origin:50% 59%}
+/* Shine: a light band clipped by the logo shape (the mask is static, only the band moves) */
+.shine{position:absolute;inset:0;overflow:hidden;opacity:0;
+  -webkit-mask:var(--logo-mask) center/100% 100% no-repeat;mask:var(--logo-mask) center/100% 100% no-repeat}
+.shine i{position:absolute;top:-10%;bottom:-10%;left:0;width:34%;transform:translateX(-120%) skewX(-18deg);will-change:transform;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.55),transparent)}
+
+
+.dots{position:absolute;left:0;right:0;top:238px;display:flex;justify-content:center;gap:9px;opacity:0;will-change:opacity}
+.dots b{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.85);opacity:.25;will-change:opacity}
+.word{position:absolute;left:0;right:0;top:206px;display:flex;justify-content:center;
+  font-size:24px;font-weight:700;letter-spacing:.26em;padding-left:.26em;color:#f5f5f7}
+.word span{opacity:0;will-change:transform,opacity}
+.tag{position:absolute;left:0;right:0;top:240px;text-align:center;font-size:11px;letter-spacing:.18em;
+  text-transform:uppercase;color:#8e8e93;opacity:0;will-change:opacity}
+
+/* UI mock-up the logo "falls" into (sizes as in Screen: 1rem = 10px) */
+.ui{position:absolute;inset:0;pointer-events:none}
+.ui .tb{position:absolute;left:0;right:0;top:0;height:46px;display:flex;align-items:center;gap:9px;padding:0 10px 0 52px;opacity:0;will-change:opacity}
+.ui .tb .t{font-size:15px;font-weight:600;color:#f5f5f7;flex:1}
+.ui .tb .g{width:34px;height:34px;border-radius:8px;background:rgba(255,255,255,.07)}
+.ui .tb .s{width:64px;height:34px;border-radius:8px;background:#ff453a}
+.ui .grid{position:absolute;left:14px;right:14px;top:58px;bottom:14px;display:grid;grid-template-columns:1.4fr 1fr;grid-template-rows:1fr 1fr;gap:10px}
+.ui .tile{border-radius:12px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.09);opacity:0;will-change:transform,opacity}
+.ui .tile:first-child{grid-row:span 2}
+
+/* ===== 1. Boot ===== */
+/* Parts drop from above: left from the top left, right from the top right, "D" straight down and last.
+   A slight squash on landing makes it "click". */
+.boot .vl{animation:dropL calc(620ms*var(--k)) linear calc(100ms*var(--k)) both}
+.boot .vr{animation:dropR calc(620ms*var(--k)) linear calc(260ms*var(--k)) both}
+.boot .d{animation:dropD calc(620ms*var(--k)) linear calc(480ms*var(--k)) both}
+.boot .dots{animation:fadeIn calc(300ms*var(--k)) ease-out calc(1250ms*var(--k)) both}
+.boot .dots b{animation:pulse calc(var(--dots)*var(--k)) ease-in-out calc(1250ms*var(--k)) infinite}
+.boot .dots b:nth-child(2){animation-delay:calc(1450ms*var(--k))}
+.boot .dots b:nth-child(3){animation-delay:calc(1650ms*var(--k))}
+@keyframes dropL{
+  0%{opacity:0;transform:translate(-34px,-70px);animation-timing-function:cubic-bezier(.5,0,.9,.6)}
+  12%{opacity:1}
+  62%{transform:scale(1.05,.9);animation-timing-function:ease-out}
+  80%{transform:translateY(-3px) scale(.99,1.02);animation-timing-function:ease-in}
+  100%{opacity:1;transform:none}}
+@keyframes dropR{
+  0%{opacity:0;transform:translate(34px,-70px);animation-timing-function:cubic-bezier(.5,0,.9,.6)}
+  12%{opacity:1}
+  62%{transform:scale(1.05,.9);animation-timing-function:ease-out}
+  80%{transform:translateY(-3px) scale(.99,1.02);animation-timing-function:ease-in}
+  100%{opacity:1;transform:none}}
+@keyframes dropD{
+  0%{opacity:0;transform:translateY(-80px);animation-timing-function:cubic-bezier(.5,0,.9,.6)}
+  12%{opacity:1}
+  62%{transform:scale(1.06,.88);animation-timing-function:ease-out}
+  80%{transform:translateY(-4px) scale(.98,1.03);animation-timing-function:ease-in}
+  100%{opacity:1;transform:none}}
+@keyframes pulse{0%,100%{opacity:.25}35%{opacity:1}70%{opacity:.25}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes fadeOut{from{opacity:1}to{opacity:0}}
+
+/* ===== 2. Launch: starts from the last boot frame ===== */
+.launch .part{animation:none;opacity:1}
+.launch .dots{animation:fadeOut calc(180ms*var(--k)) ease-in both}
+.launch .dots b{animation:none}
+.launch .shine{opacity:1}
+.launch .shine i{animation:sweep calc(650ms*var(--k)) var(--ease) calc(120ms*var(--k)) both}
+.launch .mark{animation:lift calc(420ms*var(--k)) var(--ease) calc(280ms*var(--k)) both}
+.launch .word span{animation:letter calc(380ms*var(--k)) var(--out) both}
+.launch .word span:nth-child(1){animation-delay:calc(420ms*var(--k))}
+.launch .word span:nth-child(2){animation-delay:calc(470ms*var(--k))}
+.launch .word span:nth-child(3){animation-delay:calc(520ms*var(--k))}
+.launch .word span:nth-child(4){animation-delay:calc(570ms*var(--k))}
+.launch .word span:nth-child(5){animation-delay:calc(620ms*var(--k))}
+.launch .tag{animation:fadeIn calc(300ms*var(--k)) ease-out calc(760ms*var(--k)) both,fadeOut calc(220ms*var(--k)) ease-in calc(1330ms*var(--k)) forwards}
+/* The logo flies to its place in the top bar (centre 28,23; size 30px), the word mark fades out */
+.launch .fly{animation:toBar calc(560ms*var(--k)) var(--ease) calc(1350ms*var(--k)) both}
+.launch .word{animation:fadeOut calc(220ms*var(--k)) ease-in calc(1330ms*var(--k)) forwards}
+.launch .glow{animation:fadeIn calc(500ms*var(--k)) ease-out calc(1400ms*var(--k)) both}
+.launch .ui .tb{animation:fadeIn calc(300ms*var(--k)) ease-out calc(1650ms*var(--k)) both}
+.launch .ui .tile{animation:tileIn calc(380ms*var(--k)) var(--out) both}
+.launch .ui .tile:nth-child(1){animation-delay:calc(1600ms*var(--k))}
+.launch .ui .tile:nth-child(2){animation-delay:calc(1660ms*var(--k))}
+.launch .ui .tile:nth-child(3){animation-delay:calc(1720ms*var(--k))}
+@keyframes sweep{from{transform:translateX(-120%) skewX(-18deg)}to{transform:translateX(330%) skewX(-18deg)}}
+@keyframes lift{from{transform:none}to{transform:translateY(-22px)}}
+@keyframes letter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes toBar{from{transform:none}to{transform:translate(-212px,-131px) scale(.268)}}
+@keyframes tileIn{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
+
+@media (prefers-reduced-motion:reduce){.stage *{animation-duration:1ms!important;animation-delay:0s!important;animation-iteration-count:1!important}}
+
+/* ===== Control panel (desktop only) ===== */
+.panel{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:center;font-size:13px}
+.panel button{font:inherit;color:#f5f5f7;background:#2c2c2e;border:0;border-radius:8px;padding:8px 14px;cursor:pointer}
+.panel button.on{background:var(--brand)}
+.panel label{display:flex;gap:6px;align-items:center;color:#8e8e93}
+.fps{font:12px ui-monospace,monospace;color:#8e8e93;min-width:62px}
+body.native .fps{position:fixed;right:4px;bottom:2px;z-index:9;display:none}
+body.native.showfps .fps{display:block}
+</style>
+</head>
+<body>
+<div class="frame">
+  <div class="stage" id="stage">
+    <div class="glow"></div>
+    <div class="ui">
+      <div class="tb"><span class="t">Voron 2.4</span><span class="g"></span><span class="s"></span></div>
+      <div class="grid"><div class="tile"></div><div class="tile"></div><div class="tile"></div></div>
+    </div>
+    <div class="fly"><div class="mark" id="mark"></div></div>
+    <div class="dots"><b></b><b></b><b></b></div>
+    <div class="word"><span>V</span><span>Y</span><span>R</span><span>O</span><span>N</span></div>
+    <div class="tag">Klipper UI</div>
+  </div>
+</div>
+
+<div class="panel">
+  <button data-run="boot">1 · Boot</button>
+  <button data-run="launch">2 · Launch Vyron</button>
+  <button data-run="full">Both</button>
+  <label><input type="checkbox" id="slow"> slow ×4</label>
+  <span class="fps" id="fps">— fps</span>
+</div>
+
+<script>
+// Logo geometry — the same as packages/shared/src/logo.js (copied so the file opens on its own)
+const VIEWBOX = '-3 -11 70 70'
+const BAND = 'M1 1H10L32 41.5 54 1H63L38 47H26Z'
+const D = 'M16 1H40.4A4.5 4.5 0 0 1 44.37 7.67L32 30.4Z'
+const HOLE = 'M27 6.5H37L32 15.7Z'
+
+const svg = inner => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${VIEWBOX}">${inner}</svg>`
+const mark = document.getElementById('mark')
+// The V is split along its axis (x = 32) into two bars; the halves overlap slightly so there is no seam at rest
+const half = (id, x0, x1) => svg(`<defs><clipPath id="${id}"><rect x="${x0}" y="-20" width="${x1 - x0}" height="90"/></clipPath></defs>` +
+  `<path d="${BAND}" fill="var(--brand)" clip-path="url(#${id})"/>`)
+mark.innerHTML =
+  `<div class="part vl">${half('cl', -10, 32.3)}</div>` +
+  `<div class="part vr">${half('cr', 31.7, 80)}</div>` +
+  `<div class="part d">${svg(`<path d="${D}" fill="var(--brand)"/><path d="${HOLE}" fill="#000" fill-opacity=".38"/>`)}</div>` +
+  '<div class="shine"><i></i></div>'
+document.documentElement.style.setProperty('--logo-mask',
+  `url("data:image/svg+xml,${encodeURIComponent(svg(`<path d="${BAND}"/><path d="${D}"/>`))}")`)
+
+const stage = document.getElementById('stage')
+const BOOT_MS = 3600 // how long the "system boots" in "Both" mode
+let timer = 0
+
+function run(mode) {
+  clearTimeout(timer)
+  stage.className = 'stage'
+  void stage.offsetWidth // restart the CSS animations
+  const k = +getComputedStyle(document.documentElement).getPropertyValue('--k') || 1
+  if (mode === 'full') {
+    stage.classList.add('boot')
+    timer = setTimeout(() => stage.classList.add('launch'), BOOT_MS * k) // "system ready"
+  } else {
+    if (mode === 'launch') stage.classList.add('boot') // end state of boot = start of launch
+    stage.classList.add(mode)
+  }
+  document.querySelectorAll('[data-run]').forEach(b => b.classList.toggle('on', b.dataset.run === mode))
+}
+
+document.querySelectorAll('[data-run]').forEach(b => b.addEventListener('click', () => run(b.dataset.run)))
+document.getElementById('slow').addEventListener('change', e =>
+  document.documentElement.style.setProperty('--k', e.target.checked ? 4 : 1))
+
+// Frame counter: on the TFT we check that ~25–30 fps holds while moving
+const fpsEl = document.getElementById('fps')
+let frames = 0, t0 = performance.now()
+;(function tick(t) {
+  frames++
+  if (t - t0 >= 500) { fpsEl.textContent = Math.round(frames * 1000 / (t - t0)) + ' fps'; frames = 0; t0 = t }
+  requestAnimationFrame(tick)
+})(t0)
+
+const q = new URLSearchParams(location.search)
+if (q.has('native')) document.body.classList.add('native')
+if (q.has('fps')) document.body.classList.add('showfps')
+run(q.get('auto') || 'full')
+if (q.has('t')) requestAnimationFrame(() => document.getAnimations().forEach(a => { a.pause(); a.currentTime = +q.get('t') }))
+</script>
+</body>
+</html>
